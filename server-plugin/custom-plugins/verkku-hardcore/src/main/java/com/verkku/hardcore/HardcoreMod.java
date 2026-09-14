@@ -47,39 +47,69 @@ public class HardcoreMod implements ModInitializer {
         //   2) downed timer expires -> fail.mcfunction calls kill @s -> player respawns -> COPY_FROM fires
         // We only decrement life on case 2 (player had the downed tag when they died).
         ServerPlayerEvents.COPY_FROM.register((oldPlayer, newPlayer, force) -> {
-            LOGGER.info("COPY_FROM fired for {} (force={})", newPlayer.getName().getString(), force);
-            if (lifeManager == null || koHandler == null) return;
-
-            // Check if old player had the downed tag BEFORE scheduling
+            String oldName = oldPlayer.getName().getString();
+            String newName = newPlayer.getName().getString();
             boolean wasDowned = oldPlayer.entityTags().contains("simplerevive.downed");
-            LOGGER.info("COPY_FROM: oldPlayer {} downed tag = {}", oldPlayer.getName().getString(), wasDowned);
+            boolean hadDownedInitiated = oldPlayer.entityTags().contains("simplerevive.downed.initiated");
+            int oldDeathCount = oldPlayer.getStats().getValue(net.minecraft.stats.Stats.CUSTOM.get(net.minecraft.stats.Stats.DEATHS));
+            int oldHealth = (int) oldPlayer.getHealth();
+            boolean oldAlive = oldPlayer.isAlive();
+
+            LOGGER.info("=== COPY_FROM DETAIL ===");
+            LOGGER.info("  Player: {} -> {}", oldName, newName);
+            LOGGER.info("  force={}", force);
+            LOGGER.info("  simplerevive.downed={}", wasDowned);
+            LOGGER.info("  simplerevive.downed.initiated={}", hadDownedInitiated);
+            LOGGER.info("  oldPlayer.deathCount={}", oldDeathCount);
+            LOGGER.info("  oldPlayer.health={} alive={}", oldHealth, oldAlive);
+            LOGGER.info("  oldPlayer.allTags={}", oldPlayer.entityTags());
+            LOGGER.info("=== END COPY_FROM DETAIL ===");
+
+            if (lifeManager == null || koHandler == null) return;
 
             server.execute(() -> {
                 try {
                     if (!wasDowned) {
-                        LOGGER.info("Player {} respawned without downed tag — skipping life decrement (Simple Revive handles it)", newPlayer.getName().getString());
+                        LOGGER.info("DECISION: SKIP life decrement for {} — no downed tag (initial death handled by Simple Revive)", newName);
                         return;
                     }
 
+                    // CRITICAL FIX: With Simple Revive + immediate_respawn, the tick function may run
+                    // BEFORE COPY_FROM in the same tick. This means on the INITIAL death:
+                    //   1) deathCount increments
+                    //   2) tick function runs → down_me sets simplerevive.downed tag
+                    //   3) COPY_FROM fires → sees the tag → incorrectly decrements life
+                    //
+                    // To distinguish: truly downed players (timer running) have simplerevive.downed.initiated
+                    // (set by initiate.mcfunction after full setup). Players where the tag was just set
+                    // by down_me on the initial death won't have initiated yet.
+                    boolean wasDownedInitiated = newPlayer.entityTags().contains("simplerevive.downed.initiated")
+                        || hadDownedInitiated;
+                    if (!wasDownedInitiated) {
+                        LOGGER.info("DECISION: SKIP life decrement for {} — had downed tag but NOT initiated (initial death, tick ran before COPY_FROM)", newName);
+                        return;
+                    }
+
+                    LOGGER.info("DECISION: DECREMENT life for {} — was fully downed (downed.initiated=true, timer expired or failed revive)", newName);
                     boolean hadLives = lifeManager.decrementLife(newPlayer);
                     int remaining = lifeManager.getLives(newPlayer);
-                    LOGGER.info("Player {} now has {} lives remaining after downed timer expired", newPlayer.getName().getString(), remaining);
+                    LOGGER.info("Player {} now has {} lives remaining after downed timer expired", newName, remaining);
 
                     // Sync lives to all clients immediately
                     koHandler.syncLivesToAllPlayers();
-                    LOGGER.info("Synced lives to all players after COPY_FROM for {}", newPlayer.getName().getString());
+                    LOGGER.info("Synced lives to all players after COPY_FROM for {}", newName);
 
                     if (!hadLives || remaining <= 0) {
-                        LOGGER.info("Player {} has no lives left! Triggering world regeneration", newPlayer.getName().getString());
+                        LOGGER.info("Player {} has no lives left! Triggering world regeneration", newName);
                         worldRegenManager.triggerWorldRegeneration();
                     } else {
-                        String message = "§e§l" + newPlayer.getName().getString() + " respawned. §c§l(" + remaining + " vidas restantes)";
+                        String message = "§e§l" + newName + " respawned. §c§l(" + remaining + " vidas restantes)";
                         server.getPlayerList().broadcastSystemMessage(
                             net.minecraft.network.chat.Component.literal(message), false
                         );
                     }
                 } catch (Exception e) {
-                    LOGGER.error("Error handling respawn for {}: {}", newPlayer.getName().getString(), e.getMessage(), e);
+                    LOGGER.error("Error handling respawn for {}: {}", newName, e.getMessage(), e);
                 }
             });
         });
